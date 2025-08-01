@@ -46,7 +46,7 @@ public:
         }
         m_widget->clear();
 
-        for (int i=0;i<std::fmin(m_messages.size(), m_maxMessageCount);i++) {
+        for (int i=0;i<std::min(m_messages.size(), m_maxMessageCount);i++) {
             m_widget->addItem(m_messages[i]);
         }
         if (m_messages.size()!=0)
