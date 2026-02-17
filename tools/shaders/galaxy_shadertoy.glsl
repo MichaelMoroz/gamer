@@ -1,3 +1,6 @@
+// Fork of "GAMER Galaxy viewer " by michael0884. https://shadertoy.com/view/W3Gfz1
+// 2026-02-17 02:17:02
+
 // preset constants
 #define PRESET_SPIRAL 0
 #define PRESET_SOMBRERO 1
@@ -8,10 +11,76 @@
 #define PRESET_TONSOFARMS 6
 #define PRESET_VORTEXCLOUD 7
 #define PRESET_WHEELGALAXY 8
-#define GALAXY_PRESET PRESET_REDBAR // edit to choose preset
+#define GALAXY_PRESET PRESET_WHEELGALAXY // edit to choose preset
+
+// render tuning
+#define MARCH_MAX_STEPS 512
+#define MARCH_BASE_STEP 0.005
+#define MARCH_STEP_ALPHA 0.002
+#define MARCH_DENSITY_STEP_SCALE 200.0
+#define MARCH_WEIGHT_THRESHOLD 0.0005
+#define MARCH_SAMPLE_DITHER 1.0
+#define DISK_EDGE_FADE_START 0.82
+#define DISK_EDGE_FADE_END 1.02
+#define VOLUME_EDGE_FADE_START 0.90
+#define VOLUME_EDGE_FADE_END 1.02
+#define HEIGHT_EDGE_FADE_START 1.6
+#define HEIGHT_EDGE_FADE_END 2.2
+
+// post / tonemap
+#define POST_TANH_STRENGTH 0.04
+
+// camera / view
+#define CAMERA_RADIUS 0.4
+#define CAMERA_FOV_DEG 60.0
+#define CAMERA_IDLE_AZ_SPEED 0.35
+#define CAMERA_IDLE_EL 0.6
+#define CAMERA_MOUSE_EL_BIAS 0.6
+#define CAMERA_EL_CLAMP 1.45
 
 const float PI = 3.14159265;
 const int MAX_COMPONENTS = 8;
+
+struct GalaxyParams {
+    vec3 axis;
+    float winding_b;
+    float winding_n;
+    float no_arms;
+    vec4 arms;
+};
+
+struct MarchParams {
+    vec3 camera;
+    vec3 dir;
+    vec2 fragCoord;
+    float t0;
+    float tFar;
+    float step;
+    float rayStep;
+    GalaxyParams g;
+};
+
+struct SampleContribution {
+    vec3 emit;
+    vec3 trans;
+};
+
+struct ComponentParams {
+    int cid;
+    float strength;
+    float arm;
+    float z0;
+    float r0;
+    float isActive;
+    float delta;
+    float winding_mul;
+    float scale;
+    float noise_offset;
+    float noise_tilt;
+    float ks;
+    float inner;
+    vec3 spec;
+};
 
 const ivec3 grad3[16] = ivec3[16](
     ivec3(1,1,0), ivec3(-1,1,0), ivec3(1,-1,0), ivec3(-1,-1,0),
@@ -22,7 +91,11 @@ const ivec3 grad3[16] = ivec3[16](
 
 int fastfloor(float x) { return x > 0.0 ? int(x) : int(x) - 1; }
 float dot3i(ivec3 g, float x, float y, float z) { return float(g.x)*x + float(g.y)*y + float(g.z)*z; }
-float hash12(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+float pseudo_blue_noise(vec2 p)
+{
+    vec2 px = floor(p);
+    return fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))));
+}
 uint hash_u32(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
 uint hash_i3(ivec3 p)
 {
@@ -143,6 +216,31 @@ vec3 spectrum_from_id(int sid)
     return vec3(1.0, 0.3, 0.8);                // purple
 }
 
+ComponentParams make_component(
+    int cid,
+    float strength, float arm, float z0, float r0,
+    float isActive, float delta, float winding_mul, float scale,
+    float noise_offset, float noise_tilt, float ks, float inner,
+    vec3 spec)
+{
+    ComponentParams c;
+    c.cid = cid;
+    c.strength = strength;
+    c.arm = arm;
+    c.z0 = z0;
+    c.r0 = r0;
+    c.isActive = isActive;
+    c.delta = delta;
+    c.winding_mul = winding_mul;
+    c.scale = scale;
+    c.noise_offset = noise_offset;
+    c.noise_tilt = noise_tilt;
+    c.ks = ks;
+    c.inner = inner;
+    c.spec = spec;
+    return c;
+}
+
 void get_galaxy_params(out vec3 axis, out float winding_b, out float winding_n, out float no_arms, out vec4 arms)
 {
 #if GALAXY_PRESET == PRESET_SPIRAL
@@ -213,82 +311,82 @@ int component_count()
 #endif
 }
 
-void load_component(int i, out int cid, out vec4 p0, out vec4 p1, out vec4 p2, out vec3 spec)
+void load_component(int i, out ComponentParams c)
 {
 #if GALAXY_PRESET == PRESET_SPIRAL
-    if (i==0) { cid=0; p0=vec4(25.0,1.0,0.02,4.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(1); return; }
-    if (i==1) { cid=1; p0=vec4(5000.0,0.3,0.02,0.4); p1=vec4(1.0,0.0,0.1,10.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==2) { cid=3; p0=vec4(150.0,0.2,0.03,0.45); p1=vec4(1.0,0.0,0.07,5.0); p2=vec4(1.0,1.5,1.0,0.2); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=0; p0=vec4(30.0,1.0,0.02,10.0); p1=vec4(0.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(4); return; }
-    if (i==4) { cid=5; p0=vec4(10.0,0.1,0.05,0.3); p1=vec4(1.0,0.0,0.0,6.0); p2=vec4(0.0,15.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==5) { cid=1; p0=vec4(1000.0,0.02,0.02,0.3); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(0); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 25.0, 1.0, 0.02, 4.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(1)); return; }
+    if (i==1) { c = make_component(1, 5000.0, 0.3, 0.02, 0.4, 1.0, 0.0, 0.1, 10.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==2) { c = make_component(3, 150.0, 0.2, 0.03, 0.45, 1.0, 0.0, 0.07, 5.0, 1.0, 1.5, 1.0, 0.2, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(0, 30.0, 1.0, 0.02, 10.0, 0.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(4)); return; }
+    if (i==4) { c = make_component(5, 10.0, 0.1, 0.05, 0.3, 1.0, 0.0, 0.0, 6.0, 0.0, 15.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==5) { c = make_component(1, 1000.0, 0.02, 0.02, 0.3, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(0)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_SOMBRERO
-    if (i==0) { cid=0; p0=vec4(30.0,1.0,0.02,8.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(1); return; }
-    if (i==1) { cid=1; p0=vec4(400.0,0.01,0.04,0.5); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,0.01,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==2) { cid=3; p0=vec4(50.0,0.1,0.02,0.4); p1=vec4(1.0,0.0,0.1,4.0); p2=vec4(1.2,1.5,1.0,0.6); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=3; p0=vec4(30.0,0.5,0.02,0.15); p1=vec4(1.0,0.0,0.1,5.0); p2=vec4(1.1,1.5,1.0,0.05); spec=spectrum_from_id(2); return; }
-    if (i==4) { cid=5; p0=vec4(3.0,0.1,0.05,0.5); p1=vec4(1.0,0.0,0.1,150.0); p2=vec4(0.0,12.0,1.0,0.0); spec=spectrum_from_id(0); return; }
-    if (i==5) { cid=0; p0=vec4(5.0,0.1,0.05,4.0); p1=vec4(1.0,0.0,0.1,150.0); p2=vec4(0.0,12.0,1.0,0.0); spec=spectrum_from_id(0); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 30.0, 1.0, 0.02, 8.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(1)); return; }
+    if (i==1) { c = make_component(1, 400.0, 0.01, 0.04, 0.5, 1.0, 0.0, 0.1, 1.0, 0.0, 0.01, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==2) { c = make_component(3, 50.0, 0.1, 0.02, 0.4, 1.0, 0.0, 0.1, 4.0, 1.2, 1.5, 1.0, 0.6, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(3, 30.0, 0.5, 0.02, 0.15, 1.0, 0.0, 0.1, 5.0, 1.1, 1.5, 1.0, 0.05, spectrum_from_id(2)); return; }
+    if (i==4) { c = make_component(5, 3.0, 0.1, 0.05, 0.5, 1.0, 0.0, 0.1, 150.0, 0.0, 12.0, 1.0, 0.0, spectrum_from_id(0)); return; }
+    if (i==5) { c = make_component(0, 5.0, 0.1, 0.05, 4.0, 1.0, 0.0, 0.1, 150.0, 0.0, 12.0, 1.0, 0.0, spectrum_from_id(0)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_SB0
-    if (i==0) { cid=0; p0=vec4(250.0,1.0,0.02,25.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(1); return; }
-    if (i==1) { cid=1; p0=vec4(5000.0,0.4,0.02,0.3); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==2) { cid=3; p0=vec4(500.0,0.9,0.015,0.35); p1=vec4(1.0,0.0,0.1,20.0); p2=vec4(1.0,1.2,1.0,0.02); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=0; p0=vec4(30.0,1.0,0.02,10.0); p1=vec4(0.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(4); return; }
-    if (i==4) { cid=5; p0=vec4(15.0,0.5,0.03,0.3); p1=vec4(1.0,0.0,0.0,150.0); p2=vec4(0.0,15.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==5) { cid=1; p0=vec4(1000.0,0.02,0.02,0.3); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(0); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 250.0, 1.0, 0.02, 25.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(1)); return; }
+    if (i==1) { c = make_component(1, 5000.0, 0.4, 0.02, 0.3, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==2) { c = make_component(3, 500.0, 0.9, 0.015, 0.35, 1.0, 0.0, 0.1, 20.0, 1.0, 1.2, 1.0, 0.02, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(0, 30.0, 1.0, 0.02, 10.0, 0.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(4)); return; }
+    if (i==4) { c = make_component(5, 15.0, 0.5, 0.03, 0.3, 1.0, 0.0, 0.0, 150.0, 0.0, 15.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==5) { c = make_component(1, 1000.0, 0.02, 0.02, 0.3, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(0)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_IRREGULAR
-    if (i==0) { cid=1; p0=vec4(1500.0,0.1,0.02,0.5); p1=vec4(1.0,1.5,0.1,1.0); p2=vec4(0.0,0.2,1.0,0.2); spec=spectrum_from_id(2); return; }
-    if (i==1) { cid=1; p0=vec4(500.0,0.1,0.05,0.4); p1=vec4(1.0,1.5,0.1,1.0); p2=vec4(0.0,0.3,1.0,0.0); spec=spectrum_from_id(0); return; }
-    if (i==2) { cid=3; p0=vec4(10.0,0.05,0.025,0.45); p1=vec4(1.0,0.0,0.05,2.0); p2=vec4(1.5,1.5,1.0,0.3); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=5; p0=vec4(5.0,0.05,0.02,0.4); p1=vec4(1.0,0.5,0.1,5.0); p2=vec4(0.0,15.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==4) { cid=0; p0=vec4(60.0,1.0,0.02,10.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(1); return; }
-    if (i==5) { cid=5; p0=vec4(5.0,0.01,0.07,0.6); p1=vec4(1.0,0.0,0.1,100.0); p2=vec4(0.0,8.0,1.0,0.1); spec=spectrum_from_id(0); return; }
-    if (i==6) { cid=3; p0=vec4(50.0,0.15,0.02,0.3); p1=vec4(1.0,2.5,0.35,7.0); p2=vec4(1.0,1.5,1.0,0.01); spec=spectrum_from_id(2); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(1, 1500.0, 0.1, 0.02, 0.5, 1.0, 1.5, 0.1, 1.0, 0.0, 0.2, 1.0, 0.2, spectrum_from_id(2)); return; }
+    if (i==1) { c = make_component(1, 500.0, 0.1, 0.05, 0.4, 1.0, 1.5, 0.1, 1.0, 0.0, 0.3, 1.0, 0.0, spectrum_from_id(0)); return; }
+    if (i==2) { c = make_component(3, 10.0, 0.05, 0.025, 0.45, 1.0, 0.0, 0.05, 2.0, 1.5, 1.5, 1.0, 0.3, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(5, 5.0, 0.05, 0.02, 0.4, 1.0, 0.5, 0.1, 5.0, 0.0, 15.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==4) { c = make_component(0, 60.0, 1.0, 0.02, 10.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(1)); return; }
+    if (i==5) { c = make_component(5, 5.0, 0.01, 0.07, 0.6, 1.0, 0.0, 0.1, 100.0, 0.0, 8.0, 1.0, 0.1, spectrum_from_id(0)); return; }
+    if (i==6) { c = make_component(3, 50.0, 0.15, 0.02, 0.3, 1.0, 2.5, 0.35, 7.0, 1.0, 1.5, 1.0, 0.01, spectrum_from_id(2)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_IRREGULAR2
-    if (i==0) { cid=1; p0=vec4(1500.0,0.1,0.02,0.5); p1=vec4(1.0,1.5,0.1,1.0); p2=vec4(0.0,0.2,1.0,0.2); spec=spectrum_from_id(2); return; }
-    if (i==1) { cid=1; p0=vec4(500.0,0.4,0.05,0.4); p1=vec4(1.0,1.5,0.1,1.0); p2=vec4(0.0,0.3,1.0,0.25); spec=spectrum_from_id(0); return; }
-    if (i==2) { cid=3; p0=vec4(20.0,0.2,0.025,0.45); p1=vec4(1.0,0.0,0.5,5.0); p2=vec4(1.0,1.5,1.0,0.2); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=5; p0=vec4(5.0,0.1,0.02,0.4); p1=vec4(1.0,0.5,0.1,5.0); p2=vec4(0.0,15.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==4) { cid=0; p0=vec4(250.0,0.1,0.02,15.0); p1=vec4(1.0,1.5,0.1,1.0); p2=vec4(0.0,0.2,1.0,0.2); spec=spectrum_from_id(3); return; }
-    if (i==5) { cid=5; p0=vec4(5.0,0.01,0.07,0.6); p1=vec4(1.0,0.0,0.1,100.0); p2=vec4(0.0,8.0,1.0,0.1); spec=spectrum_from_id(0); return; }
-    if (i==6) { cid=3; p0=vec4(25.0,0.35,0.02,0.3); p1=vec4(1.0,2.5,0.35,5.0); p2=vec4(1.1,1.5,1.0,0.01); spec=spectrum_from_id(2); return; }
-    if (i==7) { cid=5; p0=vec4(15.0,0.1,0.04,0.5); p1=vec4(1.0,1.0,0.2,10.0); p2=vec4(0.0,10.0,1.0,0.2); spec=spectrum_from_id(1); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(1, 1500.0, 0.1, 0.02, 0.5, 1.0, 1.5, 0.1, 1.0, 0.0, 0.2, 1.0, 0.2, spectrum_from_id(2)); return; }
+    if (i==1) { c = make_component(1, 500.0, 0.4, 0.05, 0.4, 1.0, 1.5, 0.1, 1.0, 0.0, 0.3, 1.0, 0.25, spectrum_from_id(0)); return; }
+    if (i==2) { c = make_component(3, 20.0, 0.2, 0.025, 0.45, 1.0, 0.0, 0.5, 5.0, 1.0, 1.5, 1.0, 0.2, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(5, 5.0, 0.1, 0.02, 0.4, 1.0, 0.5, 0.1, 5.0, 0.0, 15.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==4) { c = make_component(0, 250.0, 0.1, 0.02, 15.0, 1.0, 1.5, 0.1, 1.0, 0.0, 0.2, 1.0, 0.2, spectrum_from_id(3)); return; }
+    if (i==5) { c = make_component(5, 5.0, 0.01, 0.07, 0.6, 1.0, 0.0, 0.1, 100.0, 0.0, 8.0, 1.0, 0.1, spectrum_from_id(0)); return; }
+    if (i==6) { c = make_component(3, 25.0, 0.35, 0.02, 0.3, 1.0, 2.5, 0.35, 5.0, 1.1, 1.5, 1.0, 0.01, spectrum_from_id(2)); return; }
+    if (i==7) { c = make_component(5, 15.0, 0.1, 0.04, 0.5, 1.0, 1.0, 0.2, 10.0, 0.0, 10.0, 1.0, 0.2, spectrum_from_id(1)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_REDBAR
-    if (i==0) { cid=0; p0=vec4(13.0,1.0,0.03,3.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(1); return; }
-    if (i==1) { cid=1; p0=vec4(500.0,0.1,0.03,0.45); p1=vec4(1.0,0.0,0.1,5.0); p2=vec4(0.0,0.5,-0.5,0.0); spec=spectrum_from_id(0); return; }
-    if (i==2) { cid=0; p0=vec4(250.0,1.0,0.02,15.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=2; p0=vec4(150.0,0.2,0.01,0.45); p1=vec4(1.0,0.0,0.2,1.0); p2=vec4(0.0,1.0,-0.8,0.0); spec=spectrum_from_id(2); return; }
-    if (i==4) { cid=5; p0=vec4(50.0,0.3,0.04,0.4); p1=vec4(1.0,0.0,0.1,30.0); p2=vec4(0.0,10.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==5) { cid=3; p0=vec4(300.0,2.0,0.02,5.0); p1=vec4(1.0,0.0,0.1,8.0); p2=vec4(1.0,1.5,1.0,0.0); spec=spectrum_from_id(2); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 13.0, 1.0, 0.03, 3.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(1)); return; }
+    if (i==1) { c = make_component(1, 500.0, 0.1, 0.03, 0.45, 1.0, 0.0, 0.1, 5.0, 0.0, 0.5, -0.5, 0.0, spectrum_from_id(0)); return; }
+    if (i==2) { c = make_component(0, 250.0, 1.0, 0.02, 15.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(2, 150.0, 0.2, 0.01, 0.45, 1.0, 0.0, 0.2, 1.0, 0.0, 1.0, -0.8, 0.0, spectrum_from_id(2)); return; }
+    if (i==4) { c = make_component(5, 50.0, 0.3, 0.04, 0.4, 1.0, 0.0, 0.1, 30.0, 0.0, 10.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==5) { c = make_component(3, 300.0, 2.0, 0.02, 5.0, 1.0, 0.0, 0.1, 8.0, 1.0, 1.5, 1.0, 0.0, spectrum_from_id(2)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_TONSOFARMS
-    if (i==0) { cid=0; p0=vec4(100.0,1.0,0.03,20.1); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(3); return; }
-    if (i==1) { cid=1; p0=vec4(500.0,0.05,0.03,0.45); p1=vec4(1.0,0.0,0.1,5.0); p2=vec4(0.0,0.5,1.0,0.0); spec=spectrum_from_id(0); return; }
-    if (i==2) { cid=5; p0=vec4(5.0,0.3,0.04,0.4); p1=vec4(1.0,0.0,0.1,50.0); p2=vec4(0.0,15.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=0; p0=vec4(20.0,1.0,0.02,5.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(1); return; }
-    if (i==4) { cid=1; p0=vec4(3900.0,0.3,0.02,0.4); p1=vec4(1.0,0.0,0.1,3.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(2); return; }
-    if (i==5) { cid=3; p0=vec4(150.0,0.5,0.015,0.4); p1=vec4(1.0,0.0,0.1,6.0); p2=vec4(1.05,1.5,1.0,0.25); spec=spectrum_from_id(2); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 100.0, 1.0, 0.03, 20.1, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(3)); return; }
+    if (i==1) { c = make_component(1, 500.0, 0.05, 0.03, 0.45, 1.0, 0.0, 0.1, 5.0, 0.0, 0.5, 1.0, 0.0, spectrum_from_id(0)); return; }
+    if (i==2) { c = make_component(5, 5.0, 0.3, 0.04, 0.4, 1.0, 0.0, 0.1, 50.0, 0.0, 15.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(0, 20.0, 1.0, 0.02, 5.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(1)); return; }
+    if (i==4) { c = make_component(1, 3900.0, 0.3, 0.02, 0.4, 1.0, 0.0, 0.1, 3.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(2)); return; }
+    if (i==5) { c = make_component(3, 150.0, 0.5, 0.015, 0.4, 1.0, 0.0, 0.1, 6.0, 1.05, 1.5, 1.0, 0.25, spectrum_from_id(2)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_VORTEXCLOUD
-    if (i==0) { cid=0; p0=vec4(30.0,1.0,0.02,3.0); p1=vec4(1.0,0.0,0.5,1.0); p2=vec4(0.0,1.0,1.0,0.1); spec=spectrum_from_id(4); return; }
-    if (i==1) { cid=3; p0=vec4(15.0,0.1,0.05,0.5); p1=vec4(1.0,0.0,0.2,2.0); p2=vec4(1.3,1.0,1.0,0.25); spec=spectrum_from_id(2); return; }
-    if (i==2) { cid=1; p0=vec4(100.0,0.01,0.03,0.6); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,0.01,1.0,0.0); spec=spectrum_from_id(0); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 30.0, 1.0, 0.02, 3.0, 1.0, 0.0, 0.5, 1.0, 0.0, 1.0, 1.0, 0.1, spectrum_from_id(4)); return; }
+    if (i==1) { c = make_component(3, 15.0, 0.1, 0.05, 0.5, 1.0, 0.0, 0.2, 2.0, 1.3, 1.0, 1.0, 0.25, spectrum_from_id(2)); return; }
+    if (i==2) { c = make_component(1, 100.0, 0.01, 0.03, 0.6, 1.0, 0.0, 0.1, 1.0, 0.0, 0.01, 1.0, 0.0, spectrum_from_id(0)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #elif GALAXY_PRESET == PRESET_WHEELGALAXY
-    if (i==0) { cid=0; p0=vec4(30.0,1.0,0.02,5.0); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,1.0,1.0,0.0); spec=spectrum_from_id(1); return; }
-    if (i==1) { cid=1; p0=vec4(900.0,0.01,0.03,0.4); p1=vec4(1.0,0.0,0.1,1.0); p2=vec4(0.0,0.4,1.0,0.5); spec=spectrum_from_id(2); return; }
-    if (i==2) { cid=3; p0=vec4(250.0,0.25,0.02,0.4); p1=vec4(1.0,0.0,0.1,10.0); p2=vec4(1.0,1.1,1.0,0.6); spec=spectrum_from_id(2); return; }
-    if (i==3) { cid=5; p0=vec4(0.5,0.05,0.02,0.5); p1=vec4(1.0,0.0,0.1,6.0); p2=vec4(0.0,20.0,1.0,0.3); spec=spectrum_from_id(2); return; }
-    if (i==4) { cid=5; p0=vec4(10.0,0.1,0.02,0.55); p1=vec4(1.0,0.0,0.1,100.0); p2=vec4(0.0,10.0,1.0,0.3); spec=spectrum_from_id(0); return; }
-    if (i==5) { cid=3; p0=vec4(50.0,0.2,0.02,0.2); p1=vec4(1.0,0.0,0.25,5.0); p2=vec4(1.1,1.0,1.0,0.05); spec=spectrum_from_id(2); return; }
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    if (i==0) { c = make_component(0, 30.0, 1.0, 0.02, 5.0, 1.0, 0.0, 0.1, 1.0, 0.0, 1.0, 1.0, 0.0, spectrum_from_id(1)); return; }
+    if (i==1) { c = make_component(1, 900.0, 0.01, 0.03, 0.4, 1.0, 0.0, 0.1, 1.0, 0.0, 0.4, 1.0, 0.5, spectrum_from_id(2)); return; }
+    if (i==2) { c = make_component(3, 250.0, 0.25, 0.02, 0.4, 1.0, 0.0, 0.1, 10.0, 1.0, 1.1, 1.0, 0.6, spectrum_from_id(2)); return; }
+    if (i==3) { c = make_component(5, 0.5, 0.05, 0.02, 0.5, 1.0, 0.0, 0.1, 6.0, 0.0, 20.0, 1.0, 0.3, spectrum_from_id(2)); return; }
+    if (i==4) { c = make_component(5, 100.0, 0.1, 0.02, 0.55, 1.0, 0.0, 0.1, 100.0, 0.0, 10.0, 1.0, 0.3, spectrum_from_id(0)); return; }
+    if (i==5) { c = make_component(3, 50.0, 0.2, 0.02, 0.2, 1.0, 0.0, 0.25, 5.0, 1.1, 1.0, 1.0, 0.05, spectrum_from_id(2)); return; }
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #else
-    cid=0; p0=vec4(0.0); p1=vec4(0.0); p2=vec4(0.0); spec=vec3(0.0); return;
+    c = make_component(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec3(0.0)); return;
 #endif
 }
 
@@ -312,9 +410,9 @@ bool intersect_sphere(vec3 o, vec3 d, vec3 axis, out vec3 isp1, out vec3 isp2, o
 float get_height_modulation(float z0, float height)
 {
     float h = abs(height / z0);
-    if (h > 2.0) return 0.0;
     float val = 1.0 / ((exp(h)+exp(-h))/2.0);
-    return val*val;
+    float softEdge = 1.0 - smoothstep(HEIGHT_EDGE_FADE_START, HEIGHT_EDGE_FADE_END, h);
+    return val*val*softEdge;
 }
 
 float get_winding(float rad, float winding_b, float winding_n)
@@ -353,136 +451,179 @@ float arm_value(float rad, vec3 P, float delta, float arm, float no_arms, vec4 a
     return max(v, get_arm(rad, P, arms.w, delta, arm, winding_b, winding_n));
 }
 
-vec3 post_process(vec3 v, float exposure, float gamma, float saturation)
+float sample_pos_dither(float tLower, float tUpper, float rnd)
 {
-    v *= 1.0 / max(exposure, 1e-4);
-    v = pow(max(v, 0.0), vec3(gamma));
-    float center = (v.x+v.y+v.z)/3.0;
-    vec3 tmp = vec3(center) - v;
-    v = vec3(center) - saturation * tmp;
-    v = clamp(v * 10.0, 0.0, 255.0);
-    return v / 255.0;
+    // Exact interpolation between the two actual neighboring samples on the ray.
+    return mix(tLower, tUpper, clamp(rnd, 0.0, 1.0));
+}
+
+// Non-uniform step: s_n = s0*(1 + n*alpha), t_n = s0*n*(1 + alpha*(n-1)/2)
+float stepIndexFromT(float t, float s0, float alpha)
+{
+    return alpha > 1e-6 ? (-1.0 + sqrt(1.0 + 2.0 * alpha * t / s0)) / alpha : t / s0;
+}
+
+float stepSizeAtN(float n, float s0, float alpha)
+{
+    return s0 * (1.0 + alpha * n);
+}
+
+float tAtN(float n, float s0, float alpha)
+{
+    return s0 * n * (1.0 + alpha * (n - 1.0) * 0.5);
+}
+
+SampleContribution sample_delta(vec3 p, float localStep, MarchParams mp)
+{
+    SampleContribution c;
+    c.emit = vec3(0.0);
+    c.trans = vec3(1.0);
+
+    // Component id legend (cid):
+    // 0: analytic disk / bulge emitter
+    // 1: emissive fractal cloud (octave noise)
+    // 2: absorbing cloud (octave noise attenuation)
+    // 3: absorbing ridged cloud (ridged MF attenuation)
+    // 4: emissive ridged cloud
+    // 5: star field / clumpy emissive noise
+    // Any other id: ignored
+
+    for (int ci=0; ci<MAX_COMPONENTS; ++ci) {
+        if (ci >= component_count()) break;
+
+        ComponentParams cp;
+        load_component(ci, cp);
+
+        if (cp.isActive != 1.0) continue;
+
+        vec3 P = vec3(p.x, 0.0, p.z);
+        float radius = length(P) / mp.g.axis.x;
+        float edgeFade = 1.0 - smoothstep(DISK_EDGE_FADE_START, DISK_EDGE_FADE_END, radius);
+        vec3 pn = p / mp.g.axis;
+        float volR = length(pn);
+        float volumeFade = 1.0 - smoothstep(VOLUME_EDGE_FADE_START, VOLUME_EDGE_FADE_END, volR);
+        edgeFade *= volumeFade;
+        float z = get_height_modulation(cp.z0, p.y);
+
+        if (cp.cid == 0) {
+            float rho_0 = cp.strength * (localStep * MARCH_DENSITY_STEP_SCALE);
+            float rad = (length(p) + 0.01) * cp.r0 + 0.01;
+            float bi = rho_0 * (pow(rad, -0.855) * exp(-pow(rad, 0.25)) - 0.05);
+            c.emit += max(bi, 0.0) * edgeFade * cp.spec * mp.rayStep;
+            continue;
+        }
+
+        if (z <= 0.01) continue;
+        float intensity = clamp(exp(-radius / (cp.r0 * 0.5)) - 0.01, 0.0, 1.0);
+        intensity = min(intensity, 0.1);
+        if (intensity <= 0.001) continue;
+
+        float scale_inner = pow(smoothstep(0.0, 1.0*cp.inner, radius), 4.0);
+        float armVal = 1.0;
+        float local_winding = 0.0;
+        if (cp.arm != 0.0) {
+            armVal = arm_value(radius, P, cp.delta, cp.arm, mp.g.no_arms, mp.g.arms, mp.g.winding_b, mp.g.winding_n);
+            if (cp.winding_mul != 0.0) local_winding = get_winding(radius, mp.g.winding_b, mp.g.winding_n) * cp.winding_mul;
+        }
+
+        float val = cp.strength * scale_inner * armVal * z * intensity;
+        val *= edgeFade;
+        float weighted = val * (localStep * MARCH_DENSITY_STEP_SCALE);
+        if (weighted <= MARCH_WEIGHT_THRESHOLD) continue;
+
+        if (cp.cid == 1) {
+            vec3 pd = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
+            float n = abs(octave_noise_3d(10.0, cp.ks, cp.scale*0.1, pd));
+            n = pow(max(n, 0.01), cp.noise_tilt) + cp.noise_offset;
+            if (n >= 0.0) c.emit += weighted * n * cp.spec * mp.rayStep;
+        } else if (cp.cid == 2) {
+            vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
+            float n = octave_noise_3d(9.0, cp.ks, cp.scale*0.1, r);
+            n = clamp(pow(5.0 * max(n-cp.noise_offset, 0.0), cp.noise_tilt), -10.0, 10.0);
+            vec3 att = exp(-n * weighted * cp.spec * 0.01);
+            c.emit *= att;
+            c.trans *= att;
+        } else if (cp.cid == 3) {
+            vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
+            float n = max(get_ridged_mf(r*cp.scale, cp.ks, 9, 2.5, cp.noise_offset, cp.noise_tilt), 0.0);
+            vec3 att = exp(-n * weighted * cp.spec * 0.01);
+            c.emit *= att;
+            c.trans *= att;
+        } else if (cp.cid == 4) {
+            vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
+            float n = max(get_ridged_mf(r*cp.scale, cp.ks, 9, 2.5, cp.noise_offset, cp.noise_tilt), 0.0);
+            c.emit += weighted * n * cp.spec * mp.rayStep;
+        } else if (cp.cid == 5) {
+            float perlin = abs(octave_noise_3d(10.0, cp.ks, cp.scale, p));
+            float addN = 0.0;
+            if (cp.noise_offset != 0.0) {
+                vec3 r1 = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
+                vec3 r2 = vec3(cos(local_winding*0.5*PI)*p.x + sin(local_winding*0.5*PI)*p.z, p.y, -sin(local_winding*0.5*PI)*p.x + cos(local_winding*0.5*PI)*p.z);
+                addN = cp.noise_offset * octave_noise_3d(4.0, -2.0, 0.2, r1) + 0.5*cp.noise_offset*octave_noise_3d(4.0, -2.0, 0.4, r2);
+            }
+            float v = abs(pow(perlin + 1.0 + addN, cp.noise_tilt));
+            c.emit += weighted * v * cp.spec * mp.rayStep;
+        }
+    }
+
+    return c;
+}
+
+vec3 march_galaxy(MarchParams mp)
+{
+    vec3 I = vec3(0.0);
+    float baseRnd = pseudo_blue_noise(mp.fragCoord);
+    float thickness = max(mp.tFar - mp.t0, 0.0);
+    float s0 = mp.step;
+    float alpha = MARCH_STEP_ALPHA;
+    float maxN = stepIndexFromT(thickness, s0, alpha);
+    for (int iter=0; iter<MARCH_MAX_STEPS; ++iter) {
+        float n = float(iter);
+        if (n > maxN + 1.0) break;
+        float dUpper = tAtN(n, s0, alpha);
+        float dLower = tAtN(n + 1.0, s0, alpha);
+        float cellUpper = mp.tFar - dUpper;
+        if (cellUpper <= mp.t0) break;
+        float cellLower = max(mp.tFar - dLower, mp.t0);
+        float localStep = cellUpper - cellLower;
+        if (localStep <= 0.0) break;
+        float rnd = fract(baseRnd + float(iter) * 0.7548776662466927);
+        float t = sample_pos_dither(cellLower, cellUpper, mix(0.5, rnd, MARCH_SAMPLE_DITHER));
+        vec3 p = mp.camera + mp.dir * t;
+        SampleContribution dI = sample_delta(p, localStep, mp);
+        I = I * dI.trans + dI.emit;
+        I = max(I, 0.0);
+    }
+    return I;
 }
 
 vec3 render_galaxy(vec3 camera, vec3 dir, vec2 fragCoord)
 {
-    vec3 axis;
-    float winding_b, winding_n, no_arms;
-    vec4 arms;
-    get_galaxy_params(axis, winding_b, winding_n, no_arms, arms);
+    GalaxyParams g;
+    get_galaxy_params(g.axis, g.winding_b, g.winding_n, g.no_arms, g.arms);
 
+    float rayStep = MARCH_BASE_STEP;
+    float step = rayStep;
     vec3 I = vec3(0.0);
-    float rayStep = 0.025;
 
     vec3 isp1, isp2;
     float tNear, tFar;
-    bool intersects = intersect_sphere(camera, dir, axis, isp1, isp2, tNear, tFar);
+    bool intersects = intersect_sphere(camera, dir, g.axis, isp1, isp2, tNear, tFar);
     if (intersects && tFar > 0.0) {
-        float t0 = max(tNear, 0.0);
-        float t = tFar;
-        float step = rayStep;
-        float dither = hash12(fragCoord);
-        t -= dither * step;
-        t = clamp(t, t0, tFar);
-        vec3 p = camera + dir * t;
-
-        for (int iter=0; iter<512; ++iter) {
-            if (t <= t0 - step) break;
-            step = clamp(length(p-camera) * rayStep, 0.001, 0.01);
-
-            for (int ci=0; ci<MAX_COMPONENTS; ++ci) {
-                if (ci >= component_count()) break;
-
-                int cid;
-                vec4 p0, p1, p2;
-                vec3 spec;
-                load_component(ci, cid, p0, p1, p2, spec);
-
-                float strength = p0.x;
-                float arm = p0.y;
-                float z0 = p0.z;
-                float r0 = p0.w;
-
-                float isActive = p1.x;
-                float delta = p1.y;
-                float winding_mul = p1.z;
-                float scale = p1.w;
-
-                float noise_offset = p2.x;
-                float noise_tilt = p2.y;
-                float ks = p2.z;
-                float inner = p2.w;
-
-                if (isActive != 1.0) continue;
-
-                vec3 P = vec3(p.x, 0.0, p.z);
-                float radius = length(P) / axis.x;
-                float z = get_height_modulation(z0, p.y);
-
-                if (cid == 0) {
-                    float rho_0 = strength * (step * 200.0);
-                    float rad = (length(p) + 0.01) * r0 + 0.01;
-                    float bi = rho_0 * (pow(rad, -0.855) * exp(-pow(rad, 0.25)) - 0.05);
-                    I += max(bi, 0.0) * spec * rayStep;
-                    continue;
-                }
-
-                if (z <= 0.01) continue;
-                float intensity = clamp(exp(-radius / (r0 * 0.5)) - 0.01, 0.0, 1.0);
-                intensity = min(intensity, 0.1);
-                if (intensity <= 0.001) continue;
-
-                float scale_inner = pow(smoothstep(0.0, 1.0*inner, radius), 4.0);
-                float armVal = 1.0;
-                float local_winding = 0.0;
-                if (arm != 0.0) {
-                    armVal = arm_value(radius, P, delta, arm, no_arms, arms, winding_b, winding_n);
-                    if (winding_mul != 0.0) local_winding = get_winding(radius, winding_b, winding_n) * winding_mul;
-                }
-
-                float val = strength * scale_inner * armVal * z * intensity;
-                float weighted = val * (step * 200.0);
-                if (weighted <= 0.0005) continue;
-
-                if (cid == 1) {
-                    vec3 pd = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
-                    float n = abs(octave_noise_3d(10.0, ks, scale*0.1, pd));
-                    n = pow(max(n, 0.01), noise_tilt) + noise_offset;
-                    if (n >= 0.0) I += weighted * n * spec * rayStep;
-                } else if (cid == 2) {
-                    vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
-                    float n = octave_noise_3d(9.0, ks, scale*0.1, r);
-                    n = clamp(pow(5.0 * max(n-noise_offset, 0.0), noise_tilt), -10.0, 10.0);
-                    I *= exp(-n * weighted * spec * 0.01);
-                } else if (cid == 3) {
-                    vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
-                    float n = max(get_ridged_mf(r*scale, ks, 9, 2.5, noise_offset, noise_tilt), 0.0);
-                    I *= exp(-n * weighted * spec * 0.01);
-                } else if (cid == 4) {
-                    vec3 r = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
-                    float n = max(get_ridged_mf(r*scale, ks, 9, 2.5, noise_offset, noise_tilt), 0.0);
-                    I += weighted * n * spec * rayStep;
-                } else if (cid == 5) {
-                    float perlin = abs(octave_noise_3d(10.0, ks, scale, p));
-                    float addN = 0.0;
-                    if (noise_offset != 0.0) {
-                        vec3 r1 = vec3(cos(local_winding*PI)*p.x + sin(local_winding*PI)*p.z, p.y, -sin(local_winding*PI)*p.x + cos(local_winding*PI)*p.z);
-                        vec3 r2 = vec3(cos(local_winding*0.5*PI)*p.x + sin(local_winding*0.5*PI)*p.z, p.y, -sin(local_winding*0.5*PI)*p.x + cos(local_winding*0.5*PI)*p.z);
-                        addN = noise_offset * octave_noise_3d(4.0, -2.0, 0.2, r1) + 0.5*noise_offset*octave_noise_3d(4.0, -2.0, 0.4, r2);
-                    }
-                    float v = abs(pow(perlin + 1.0 + addN, noise_tilt));
-                    I += weighted * v * spec * rayStep;
-                }
-            }
-
-            p -= dir * step;
-            t -= step;
-            I = max(I, 0.0);
-        }
+        MarchParams mp;
+        mp.camera = camera;
+        mp.dir = dir;
+        mp.fragCoord = fragCoord;
+        mp.t0 = max(tNear, 0.0);
+        mp.tFar = tFar;
+        mp.step = step;
+        mp.rayStep = rayStep;
+        mp.g = g;
+        I = march_galaxy(mp);
     }
 
     I *= 0.01 / rayStep;
-    return post_process(I, 1.0, 1.0, 1.0);
+    return tanh(POST_TANH_STRENGTH * I);
 }
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord)
@@ -492,12 +633,12 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     if (iMouse.z > 0.0) {
         vec2 m = iMouse.xy;
         az = (m.x / max(iResolution.x, 1.0) - 0.5) * 2.0 * PI;
-        el = clamp((m.y / max(iResolution.y, 1.0) - 0.3) * PI, -1.45, 1.45);
+        el = clamp((m.y / max(iResolution.y, 1.0) - CAMERA_MOUSE_EL_BIAS) * PI, -CAMERA_EL_CLAMP, CAMERA_EL_CLAMP);
     } else {
-        az = 0.35 * iTime;
-        el = 0.2;
+        az = CAMERA_IDLE_AZ_SPEED * iTime;
+        el = CAMERA_IDLE_EL;
     }
-    float radius = 1.2;
+    float radius = CAMERA_RADIUS;
 
     vec3 camPos = vec3(radius * cos(el) * sin(az), radius * sin(el), radius * cos(el) * cos(az));
     vec3 target = vec3(0.0);
@@ -507,9 +648,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord)
     vec3 u = cross(f, r);
 
     vec2 ndc = (2.0 * fragCoord - iResolution.xy) / max(iResolution.y, 1.0);
-    float tanHalf = tan(radians(60.0) * 0.5);
+    float tanHalf = tan(radians(CAMERA_FOV_DEG) * 0.5);
     vec3 rayDir = normalize(f + ndc.x * r * tanHalf + ndc.y * u * tanHalf);
 
     vec3 col = render_galaxy(camPos, rayDir, fragCoord);
     fragColor = vec4(col, 1.0);
 }
+
+
